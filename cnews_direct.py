@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
+import collections
+import gzip
+import http.client
 import http.cookiejar
 import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -23,10 +28,14 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
-MAX_HEIGHT = int(os.environ.get("CNEWS_MAX_HEIGHT", "720"))
-REFRESH_SECONDS = 60 * 60
+DEFAULT_MAX_HEIGHT = int(os.environ.get("CNEWS_MAX_HEIGHT", "720"))
+TOKEN_REFRESH_SECONDS = 25 * 60
 STALL_SECONDS = 45
 CONTROLS_HIDE_DELAY_MS = 3000
+PLAYLIST_WINDOW_SEGMENTS = 24
+PREFETCH_SEGMENTS = 5
+MAX_CACHED_SEGMENTS = 28
+HTTP_TIMEOUT = 4.0
 
 ATTR_RE = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
 
@@ -60,22 +69,11 @@ CHANNELS = {
     },
 }
 
-
-class PlaylistHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.split("?", 1)[0] != "/live.m3u8":
-            self.send_error(404)
-            return
-        body = self.server.playlist_data
-        self.send_response(200)
-        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
+QUALITY_OPTIONS = [
+    (720, "720p"),
+    (480, "480p"),
+    (380, "380p"),
+]
 
 
 class StreamError(Exception):
@@ -86,34 +84,131 @@ def parse_attrs(text):
     return {m.group(1): m.group(2).strip('"') for m in ATTR_RE.finditer(text)}
 
 
+class PersistentFetcher:
+    """Thread-safe HTTPS client with Keep-Alive, gzip support, short timeouts, and multi-IP retry."""
+
+    def __init__(self, timeout=HTTP_TIMEOUT):
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._conns = {}
+        self._ssl_ctx = ssl.create_default_context()
+        try:
+            # Avoid oversized multi-packet Post-Quantum (ML-KEM) TLS 1.3 ClientHello on Wi-Fi
+            self._ssl_ctx.set_ecdh_curve("X25519")
+        except Exception:
+            pass
+
+    def _acquire(self, host, port, is_https):
+        key = (host, port, is_https)
+        with self._lock:
+            pool = self._conns.get(key)
+            if pool:
+                return pool.pop()
+        if is_https:
+            return http.client.HTTPSConnection(
+                host, port, timeout=self.timeout, context=self._ssl_ctx
+            )
+        return http.client.HTTPConnection(host, port, timeout=self.timeout)
+
+    def _release(self, host, port, is_https, conn):
+        key = (host, port, is_https)
+        with self._lock:
+            pool = self._conns.setdefault(key, [])
+            if len(pool) < 6:
+                pool.append(conn)
+                return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def fetch_With_headers(self, url, cookies="", attempts=4):
+        parsed = urllib.parse.urlsplit(url.split("#", 1)[0])
+        is_https = parsed.scheme == "https"
+        host = parsed.hostname
+        port = parsed.port or (443 if is_https else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip",
+            "Referer": PLAYER_REFERER,
+            "Origin": PLAYER_ORIGIN,
+            "Connection": "keep-alive",
+        }
+        if cookies:
+            headers["Cookie"] = cookies
+
+        last_exc = None
+        for attempt in range(attempts):
+            conn = self._acquire(host, port, is_https)
+            try:
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read()
+                status = resp.status
+                resp_headers = resp.getheaders()
+                encoding = resp.getheader("Content-Encoding", "")
+                if status == 200:
+                    self._release(host, port, is_https, conn)
+                    if encoding == "gzip":
+                        data = gzip.decompress(data)
+                    return data, resp_headers
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                last_exc = StreamError(f"HTTP {status} sur {path}")
+                if status == 403:
+                    getattr(last_exc, "__dict__", {})["code"] = 403
+            except Exception as exc:
+                last_exc = exc
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if attempt + 1 < attempts:
+                time.sleep(0.1 * (attempt + 1))
+        raise last_exc or StreamError("Échec de téléchargement")
+
+    def fetch_bytes(self, url, cookies="", attempts=4):
+        data, _ = self.fetch_With_headers(url, cookies=cookies, attempts=attempts)
+        return data
+
+    def fetch_text(self, url, cookies="", attempts=4):
+        return self.fetch_bytes(url, cookies=cookies, attempts=attempts).decode(
+            "utf-8", "replace"
+        )
+
+
+GLOBAL_FETCHER = PersistentFetcher()
+
+
 def http_get(url, cookies="", referer=PLAYER_REFERER, origin=PLAYER_ORIGIN):
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "*/*",
-        "Referer": referer,
-        "Origin": origin,
-    }
-    if cookies:
-        headers["Cookie"] = cookies
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return resp.read().decode("utf-8", "replace")
+    return GLOBAL_FETCHER.fetch_text(url, cookies=cookies, attempts=4)
 
 
 def fetch_master():
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    req = urllib.request.Request(METADATA_URL, headers={"User-Agent": USER_AGENT})
-    with opener.open(req, timeout=20) as resp:
-        data = json.load(resp)
-    master_url = data["qualities"]["auto"][0]["url"]
-    cookies = "; ".join(f"{c.name}={c.value}" for c in jar)
-
     last_error = None
-    for delay in (0, 3, 8, 20):
+    for delay in (0, 0.5, 1.5, 3):
         if delay:
             time.sleep(delay)
         try:
+            raw_meta, meta_headers = GLOBAL_FETCHER.fetch_With_headers(
+                METADATA_URL, attempts=3
+            )
+            data = json.loads(raw_meta.decode("utf-8", "replace"))
+            master_url = data["qualities"]["auto"][0]["url"]
+            cookies_list = []
+            for k, v in meta_headers:
+                if k.lower() == "set-cookie":
+                    cookie_pair = v.split(";", 1)[0].strip()
+                    if cookie_pair:
+                        cookies_list.append(cookie_pair)
+            cookies = "; ".join(cookies_list)
             return http_get(master_url, cookies)
         except Exception as exc:
             last_error = exc
@@ -152,7 +247,7 @@ def extract_cnews_audio_url(master_text):
     return (preferred or audio_urls)[0]
 
 
-def build_playlist(master_text):
+def select_streams(master_text, max_height=DEFAULT_MAX_HEIGHT):
     lines = [line.strip() for line in master_text.splitlines()]
     audio = {}
     for line in lines:
@@ -176,7 +271,7 @@ def build_playlist(master_text):
             continue
         resolution = attrs.get("RESOLUTION", "")
         height = int(resolution.split("x")[1]) if "x" in resolution else 0
-        if height > MAX_HEIGHT:
+        if height > max_height:
             continue
         bandwidth = int(attrs.get("BANDWIDTH", "0"))
         variants.append(((height, bandwidth), attrs, uri))
@@ -199,7 +294,11 @@ def build_playlist(master_text):
 
     preferred = [url for url in audio_urls if "live-aac-128" in url]
     audio_url = (preferred or audio_urls)[0]
+    return attrs, video_url, audio_url
 
+
+def build_playlist(master_text, max_height=DEFAULT_MAX_HEIGHT):
+    attrs, video_url, audio_url = select_streams(master_text, max_height=max_height)
     playlist = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
@@ -222,6 +321,358 @@ def build_playlist(master_text):
     return "\n".join(playlist)
 
 
+class HLSProxyState:
+    """Proxies and trims Dailymotion's huge 4-hour M3U8 playlists, caches init MP4s in RAM,
+    and prefetches audio/video segments in parallel over persistent connections."""
+
+    def __init__(self, fetcher):
+        self.fetcher = fetcher
+        self.lock = threading.Lock()
+        self.base_local_url = ""
+        self.custom_master_bytes = None
+        self.stream_attrs = {}
+        self.upstream_urls = {"video": "", "audio": ""}
+        self.base_urls = {"video": "", "audio": ""}
+        self.playlists = {"video": b"", "audio": b""}
+        self.playlist_updated_at = {"video": 0.0, "audio": 0.0}
+        self.init_cache = {}
+        self.seg_cache = collections.OrderedDict()
+        self.inflight = {}
+        self.active = False
+        self.audio_only = False
+        self.generation = 0
+
+    def configure_custom(self, master_text):
+        with self.lock:
+            self.generation += 1
+            self.active = False
+            self.custom_master_bytes = master_text.encode("utf-8")
+
+    def configure_streams(self, attrs, video_url, audio_url, audio_only=False):
+        v_clean = video_url.split("#", 1)[0]
+        a_clean = audio_url.split("#", 1)[0]
+        v_base = v_clean.rsplit("/", 1)[0] + "/"
+        a_base = a_clean.rsplit("/", 1)[0] + "/"
+        with self.lock:
+            self.generation += 1
+            gen = self.generation
+            self.custom_master_bytes = None
+            self.stream_attrs = dict(attrs or {})
+            self.upstream_urls["video"] = v_clean
+            self.upstream_urls["audio"] = a_clean
+            self.base_urls["video"] = v_base
+            self.base_urls["audio"] = a_base
+            self.playlist_updated_at["video"] = 0.0
+            self.playlist_updated_at["audio"] = 0.0
+            self.active = True
+            self.audio_only = audio_only
+
+        # Warm up initial playlists + latest segments before mpv connects
+        threads = [
+            threading.Thread(
+                target=self.refresh_kind, args=("audio", gen, True), daemon=True
+            )
+        ]
+        if not audio_only and v_clean:
+            threads.append(
+                threading.Thread(
+                    target=self.refresh_kind, args=("video", gen, True), daemon=True
+                )
+            )
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=4.5)
+
+    def update_upstream_urls(self, video_url, audio_url):
+        """Seamlessly updates CDN token URLs without interrupting mpv."""
+        with self.lock:
+            if not self.active:
+                return
+            if video_url:
+                v_clean = video_url.split("#", 1)[0]
+                self.upstream_urls["video"] = v_clean
+                self.base_urls["video"] = v_clean.rsplit("/", 1)[0] + "/"
+            if audio_url:
+                a_clean = audio_url.split("#", 1)[0]
+                self.upstream_urls["audio"] = a_clean
+                self.base_urls["audio"] = a_clean.rsplit("/", 1)[0] + "/"
+
+    def stop(self):
+        with self.lock:
+            self.generation += 1
+            self.active = False
+            self.seg_cache.clear()
+            self.init_cache.clear()
+
+    def get_master_playlist(self):
+        with self.lock:
+            if self.custom_master_bytes is not None:
+                return self.custom_master_bytes
+            attrs = self.stream_attrs
+            base = self.base_local_url
+        playlist = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:7",
+            "#EXT-X-INDEPENDENT-SEGMENTS",
+            (
+                '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="fre",'
+                f'DEFAULT=YES,CHANNELS="2",URI="{base}/audio.m3u8"'
+            ),
+            (
+                '#EXT-X-STREAM-INF:BANDWIDTH=%s,RESOLUTION=%s,CODECS="%s",AUDIO="aud"'
+                % (
+                    attrs.get("BANDWIDTH", "2691072"),
+                    attrs.get("RESOLUTION", "1280x720"),
+                    attrs.get("CODECS", "avc1.640020,mp4a.40.2"),
+                )
+            ),
+            f"{base}/video.m3u8",
+            "",
+        ]
+        return "\n".join(playlist).encode("utf-8")
+
+    def get_media_playlist(self, kind):
+        with self.lock:
+            gen = self.generation
+            age = time.time() - self.playlist_updated_at.get(kind, 0.0)
+            cached = self.playlists.get(kind, b"")
+        if not cached or age > 1.2:
+            self.refresh_kind(kind, gen, sync_prefetch=not bool(cached))
+            with self.lock:
+                cached = self.playlists.get(kind, b"")
+        return cached
+
+    def refresh_kind(self, kind, gen=None, sync_prefetch=False):
+        with self.lock:
+            if gen is not None and gen != self.generation:
+                return
+            upstream = self.upstream_urls.get(kind, "")
+            local_base = self.base_local_url
+        if not upstream:
+            return
+        try:
+            raw_text = self.fetcher.fetch_text(upstream, attempts=2)
+        except Exception:
+            return
+
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        target_dur = "3"
+        version = "6"
+        media_seq = 0
+        init_uri = None
+        segments = []
+        cur_extinf = None
+
+        for line in lines:
+            if line.startswith("#EXT-X-VERSION:"):
+                version = line.split(":", 1)[1].strip()
+            elif line.startswith("#EXT-X-TARGETDURATION:"):
+                target_dur = line.split(":", 1)[1].strip()
+            elif line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                try:
+                    media_seq = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    media_seq = 0
+            elif line.startswith("#EXT-X-MAP:"):
+                attrs = parse_attrs(line.split(":", 1)[1])
+                init_uri = attrs.get("URI", "")
+            elif line.startswith("#EXTINF:"):
+                cur_extinf = line
+            elif not line.startswith("#"):
+                if cur_extinf is not None:
+                    segments.append((cur_extinf, line))
+                    cur_extinf = None
+
+        if not segments:
+            return
+
+        total = len(segments)
+        keep = min(total, PLAYLIST_WINDOW_SEGMENTS)
+        trimmed = segments[-keep:]
+        new_seq = media_seq + (total - keep)
+
+        out = [
+            "#EXTM3U",
+            f"#EXT-X-VERSION:{version}",
+            f"#EXT-X-TARGETDURATION:{target_dur}",
+            f"#EXT-X-MEDIA-SEQUENCE:{new_seq}",
+        ]
+        if init_uri:
+            init_name = init_uri.split("/")[-1].split("?")[0]
+            out.append(f'#EXT-X-MAP:URI="{local_base}/init/{kind}/{init_name}"')
+
+        for extinf, seg_uri in trimmed:
+            seg_name = seg_uri.split("/")[-1].split("?")[0]
+            out.append(extinf)
+            out.append(f"{local_base}/seg/{kind}/{seg_name}")
+        out.append("")
+        body = "\n".join(out).encode("utf-8")
+
+        with self.lock:
+            if gen is not None and gen != self.generation:
+                return
+            self.playlists[kind] = body
+            self.playlist_updated_at[kind] = time.time()
+
+        # Prefetch init section and latest segments
+        to_prefetch = [
+            seg_uri.split("/")[-1].split("?")[0]
+            for _, seg_uri in trimmed[-PREFETCH_SEGMENTS:]
+        ]
+        if sync_prefetch:
+            pre_threads = []
+            if init_uri:
+                init_name = init_uri.split("/")[-1].split("?")[0]
+                pre_threads.append(
+                    threading.Thread(
+                        target=self.get_init_bytes, args=(kind, init_name), daemon=True
+                    )
+                )
+            for sname in to_prefetch:
+                pre_threads.append(
+                    threading.Thread(
+                        target=self.get_segment_bytes, args=(kind, sname), daemon=True
+                    )
+                )
+            for pt in pre_threads:
+                pt.start()
+            for pt in pre_threads[:4]:
+                pt.join(timeout=2.5)
+        else:
+            if init_uri:
+                init_name = init_uri.split("/")[-1].split("?")[0]
+                threading.Thread(
+                    target=self.get_init_bytes, args=(kind, init_name), daemon=True
+                ).start()
+            for sname in to_prefetch[-2:]:
+                threading.Thread(
+                    target=self.get_segment_bytes, args=(kind, sname), daemon=True
+                ).start()
+
+    def get_init_bytes(self, kind, name):
+        key = (kind, name)
+        with self.lock:
+            if key in self.init_cache:
+                return self.init_cache[key]
+            base = self.base_urls.get(kind, "")
+        if not base:
+            return None
+        url = urllib.parse.urljoin(base, name)
+        try:
+            data = self.fetcher.fetch_bytes(url, attempts=3)
+        except Exception:
+            return None
+        with self.lock:
+            self.init_cache[key] = data
+        return data
+
+    def get_segment_bytes(self, kind, name):
+        key = (kind, name)
+        with self.lock:
+            if key in self.seg_cache:
+                self.seg_cache.move_to_end(key)
+                return self.seg_cache[key]
+            ev = self.inflight.get(key)
+            if ev is None:
+                ev = threading.Event()
+                self.inflight[key] = ev
+                is_leader = True
+            else:
+                is_leader = False
+            base = self.base_urls.get(kind, "")
+
+        if not is_leader:
+            ev.wait(timeout=6.0)
+            with self.lock:
+                return self.seg_cache.get(key)
+
+        data = None
+        try:
+            if base:
+                url = urllib.parse.urljoin(base, name)
+                data = self.fetcher.fetch_bytes(url, attempts=3)
+                with self.lock:
+                    self.seg_cache[key] = data
+                    self.seg_cache.move_to_end(key)
+                    while len(self.seg_cache) > MAX_CACHED_SEGMENTS:
+                        self.seg_cache.popitem(last=False)
+        except Exception:
+            data = None
+        finally:
+            with self.lock:
+                self.inflight.pop(key, None)
+            ev.set()
+        return data
+
+
+class PlaylistHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send_bytes(self, body, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        proxy = getattr(self.server, "proxy", None)
+        try:
+            if path == "/live.m3u8":
+                if proxy is not None and (proxy.active or proxy.custom_master_bytes is not None):
+                    body = proxy.get_master_playlist()
+                else:
+                    body = self.server.playlist_data
+                self._send_bytes(body, "application/vnd.apple.mpegurl")
+                return
+
+            if proxy is not None and path in ("/video.m3u8", "/audio.m3u8"):
+                kind = "video" if path.startswith("/video") else "audio"
+                body = proxy.get_media_playlist(kind)
+                if not body:
+                    self.send_error(503)
+                    return
+                self._send_bytes(body, "application/vnd.apple.mpegurl")
+                return
+
+            if proxy is not None and path.startswith("/init/"):
+                parts = path.split("/")
+                if len(parts) >= 4:
+                    kind, name = parts[2], parts[3]
+                    data = proxy.get_init_bytes(kind, name)
+                    if data is not None:
+                        self._send_bytes(data, "video/mp4")
+                        return
+                self.send_error(404)
+                return
+
+            if proxy is not None and path.startswith("/seg/"):
+                parts = path.split("/")
+                if len(parts) >= 4:
+                    kind, name = parts[2], parts[3]
+                    data = proxy.get_segment_bytes(kind, name)
+                    if data is not None:
+                        self._send_bytes(data, "video/iso.segment")
+                        return
+                self.send_error(504)
+                return
+
+            self.send_error(404)
+        except BrokenPipeError:
+            pass
+        except ConnectionResetError:
+            pass
+        except OSError:
+            pass
+
+    def log_message(self, *args):
+        pass
+
+
 class CNewsDirect:
     def __init__(self, root):
         self.root = root
@@ -230,6 +681,7 @@ class CNewsDirect:
             tempfile.gettempdir(), f"cnews-direct-{os.getpid()}.sock"
         )
         self.channel = "cnews_tv"
+        self.max_height = DEFAULT_MAX_HEIGHT
         self.resolve_token = 0
         self.fullscreen = False
         self.saved_geometry = None
@@ -245,14 +697,20 @@ class CNewsDirect:
         self.last_progress = time.time()
         self.resolving = False
         self.backoff = 0
+        self._running = True
 
+        self.proxy = HLSProxyState(GLOBAL_FETCHER)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), PlaylistHandler)
         self.httpd.daemon_threads = True
         self.httpd.playlist_data = b""
-        self.playlist_url = (
-            f"http://127.0.0.1:{self.httpd.server_address[1]}/live.m3u8"
-        )
+        self.httpd.proxy = self.proxy
+        port = self.httpd.server_address[1]
+        self.proxy.base_local_url = f"http://127.0.0.1:{port}"
+        self.playlist_url = f"http://127.0.0.1:{port}/live.m3u8"
+        self.audio_playlist_url = f"http://127.0.0.1:{port}/audio.m3u8"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        threading.Thread(target=self._proxy_poller_loop, daemon=True).start()
+        threading.Thread(target=self._ipc_monitor_loop, daemon=True).start()
 
         root.title(CHANNELS[self.channel]["title"])
         root.configure(bg="black")
@@ -327,11 +785,69 @@ class CNewsDirect:
         self.update_control_buttons()
         root.after(100, self.start)
         root.after(1000, self.watch)
-        root.after(3000, self.check_progress)
         root.after(200, self.poll_pointer)
-        root.after(REFRESH_SECONDS * 1000, self.refresh)
+        root.after(TOKEN_REFRESH_SECONDS * 1000, self.refresh)
 
-    def _make_btn(self, parent, text, command, bg="#252a32", fg="#f0f4f8"):
+    def _proxy_poller_loop(self):
+        """Continuously refreshes M3U8 playlists and prefetches segments in the background."""
+        while self._running:
+            time.sleep(1.4)
+            with self.proxy.lock:
+                active = self.proxy.active
+                audio_only = self.proxy.audio_only
+                gen = self.proxy.generation
+            if not active:
+                continue
+            threading.Thread(
+                target=self.proxy.refresh_kind, args=("audio", gen, False), daemon=True
+            ).start()
+            if not audio_only:
+                threading.Thread(
+                    target=self.proxy.refresh_kind,
+                    args=("video", gen, False),
+                    daemon=True,
+                ).start()
+
+    def _ipc_monitor_loop(self):
+        """Polls mpv state off the main Tkinter thread so the UI never freezes."""
+        while self._running:
+            time.sleep(3.0)
+            proc = self.proc
+            if proc is not None and proc.poll() is None:
+                position = self.get_property("time-pos")
+                paused = self.get_property("pause")
+                muted = self.get_property("mute")
+                if not self._running:
+                    break
+                self.root.after(
+                    0, lambda p=position, pa=paused, mu=muted: self._apply_ipc_state(p, pa, mu)
+                )
+            else:
+                self.last_progress = time.time()
+
+    def _apply_ipc_state(self, position, paused, muted):
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        changed = False
+        if isinstance(paused, bool) and paused != self.paused:
+            self.paused = paused
+            changed = True
+        if isinstance(muted, bool) and muted != self.muted:
+            self.muted = muted
+            changed = True
+        if changed:
+            self.update_control_buttons()
+
+        if isinstance(position, (int, float)) and not self.paused:
+            if self.last_position is None or abs(position - self.last_position) > 0.05:
+                self.last_position = position
+                self.last_progress = time.time()
+                self.backoff = 0
+            elif time.time() - self.last_progress > STALL_SECONDS:
+                self.show_status("Reprise du direct…")
+                self.root.after(500, self.start)
+
+    def _make_btn(self, parent, text, command, bg="#252a32", fg="#f0f4f8", padx=8):
         return tk.Button(
             parent,
             text=text,
@@ -343,7 +859,7 @@ class CNewsDirect:
             font=("Sans", 9, "bold"),
             relief="flat",
             bd=0,
-            padx=8,
+            padx=padx,
             pady=6,
             cursor="hand2",
             takefocus=0,
@@ -362,6 +878,20 @@ class CNewsDirect:
 
         self.top_bar.bind("<Enter>", self._on_controls_enter)
         self.top_bar.bind("<Leave>", self._on_controls_leave)
+
+        self.quality_frame = tk.Frame(self.top_bar, bg="#16191e")
+        self.quality_frame.pack(side="right", padx=6, pady=4)
+
+        self.quality_buttons = {}
+        for q_height, q_label in QUALITY_OPTIONS:
+            btn = self._make_btn(
+                self.quality_frame,
+                q_label,
+                lambda h=q_height: self.switch_quality(h),
+                padx=6,
+            )
+            btn.pack(side="left", padx=2)
+            self.quality_buttons[q_height] = btn
 
         center = tk.Frame(self.top_bar, bg="#16191e")
         center.pack(expand=True, pady=4)
@@ -604,6 +1134,14 @@ class CNewsDirect:
                 pass
         self.root.after(200, self.poll_pointer)
 
+    def switch_quality(self, height):
+        if height == self.max_height:
+            return
+        self.max_height = height
+        self.update_control_buttons()
+        if self.channel == "cnews_tv":
+            self.reload_stream()
+
     def switch_channel(self, channel_id):
         if channel_id not in CHANNELS or channel_id == self.channel:
             return
@@ -628,6 +1166,12 @@ class CNewsDirect:
                 btn.configure(text=lbl, bg=ch_info["accent"], fg="#ffffff")
             else:
                 btn.configure(text=lbl, bg="#252a32", fg="#c8d0dc")
+
+        for q_height, btn in self.quality_buttons.items():
+            if q_height == self.max_height:
+                btn.configure(bg="#2b5b84", fg="#ffffff")
+            else:
+                btn.configure(bg="#252a32", fg="#9aa5b4")
 
         self.btn_back.configure(text="⏪ -10s" if full else "-10s")
         self.btn_fwd.configure(text="⏩ +10s" if full else "+10s")
@@ -711,6 +1255,7 @@ class CNewsDirect:
         token = self.resolve_token
 
         if self.channel == "europe1":
+            self.proxy.stop()
             self.resolving = False
             self._update_audio_card()
             self.launch_mpv(EUROPE1_STREAM_URL, audio_only=True)
@@ -735,16 +1280,26 @@ class CNewsDirect:
         else:
             self.hide_status()
         threading.Thread(
-            target=self._resolve_worker, args=(token, self.channel), daemon=True
+            target=self._resolve_worker,
+            args=(token, self.channel, self.max_height),
+            daemon=True,
         ).start()
 
-    def _resolve_worker(self, token, channel):
+    def _resolve_worker(self, token, channel, max_height):
         try:
             master_text = fetch_master()
             if channel == "cnews_audio":
-                target = extract_cnews_audio_url(master_text)
+                audio_url = extract_cnews_audio_url(master_text)
+                self.proxy.configure_streams({}, "", audio_url, audio_only=True)
+                target = self.audio_playlist_url
             else:
-                target = build_playlist(master_text)
+                attrs, video_url, audio_url = select_streams(
+                    master_text, max_height=max_height
+                )
+                self.proxy.configure_streams(
+                    attrs, video_url, audio_url, audio_only=False
+                )
+                target = self.playlist_url
         except Exception as exc:
             self.root.after(0, lambda: self._on_resolve_error(token, str(exc)))
             return
@@ -765,14 +1320,14 @@ class CNewsDirect:
             self._update_audio_card()
             self.launch_mpv(target, audio_only=True)
         else:
-            self.set_playlist(target)
-            self.launch_mpv(self.playlist_url, audio_only=False)
+            self.launch_mpv(target, audio_only=False)
 
     def set_playlist(self, text):
         self.httpd.playlist_data = text.encode("utf-8")
+        self.proxy.configure_custom(text)
 
     def launch_mpv(self, stream_url, audio_only=False):
-        self.stop_mpv()
+        self.stop_mpv(stop_proxy=False)
         self.hide_status()
         self._update_audio_card()
         self.root.update_idletasks()
@@ -788,13 +1343,17 @@ class CNewsDirect:
             "--input-cursor=no",
             "--input-cursor-passthrough=yes",
             "--ao=pipewire,pulse,alsa",
-            "--audio-samplerate=48000",
             "--audio-buffer=1.0",
             "--msg-level=all=warn" if debug else "--really-quiet",
             "--cache=yes",
-            "--cache-secs=15",
-            "--demuxer-readahead-secs=10",
-            "--demuxer-max-back-bytes=50MiB",
+            "--cache-secs=20",
+            "--demuxer-readahead-secs=15",
+            "--demuxer-max-bytes=40MiB",
+            "--demuxer-max-back-bytes=30MiB",
+            "--cache-pause=yes",
+            "--cache-pause-initial=yes",
+            "--cache-pause-wait=2",
+            "--demuxer-lavf-o=live_start_index=-5,http_persistent=1,reconnect=1,reconnect_streamed=1,reconnect_delay_max=2",
             f"--title={CHANNELS[self.channel]['title']}",
             f"--input-ipc-server={self.sock_path}",
         ]
@@ -802,6 +1361,7 @@ class CNewsDirect:
             args.extend(["--vid=no", "--force-window=no"])
         else:
             args.extend([
+                "--profile=fast",
                 "--force-window=yes",
                 "--hwdec=auto-safe",
                 "--framedrop=vo",
@@ -843,48 +1403,48 @@ class CNewsDirect:
             self.root.after(delay * 1000, self.start)
         self.root.after(1500, self.watch)
 
-    def check_progress(self):
-        if self.proc is not None and self.proc.poll() is None:
-            position = self.get_property("time-pos")
-            paused = self.get_property("pause")
-            muted = self.get_property("mute")
-            if isinstance(paused, bool) and paused != self.paused:
-                self.paused = paused
-                self.update_control_buttons()
-            if isinstance(muted, bool) and muted != self.muted:
-                self.muted = muted
-                self.update_control_buttons()
-            if isinstance(position, (int, float)) and not paused:
-                if self.last_position is None or abs(position - self.last_position) > 0.05:
-                    self.last_position = position
-                    self.last_progress = time.time()
-                    self.backoff = 0
-                elif time.time() - self.last_progress > STALL_SECONDS:
-                    self.show_status("Reprise du direct…")
-                    self.root.after(500, self.start)
-        else:
-            self.last_progress = time.time()
-        self.root.after(5000, self.check_progress)
-
     def refresh(self):
+        """Refreshes Dailymotion CDN token transparently in background without restarting mpv."""
         if self.proc is not None and self.channel != "europe1":
-            self.show_status("Rafraîchissement du direct…")
-            self.root.after(400, self.start)
-        self.root.after(REFRESH_SECONDS * 1000, self.refresh)
+            threading.Thread(
+                target=self._silent_token_refresh,
+                args=(self.channel, self.max_height),
+                daemon=True,
+            ).start()
+        self.root.after(TOKEN_REFRESH_SECONDS * 1000, self.refresh)
+
+    def _silent_token_refresh(self, channel, max_height):
+        try:
+            master_text = fetch_master()
+            if channel == "cnews_audio":
+                audio_url = extract_cnews_audio_url(master_text)
+                self.proxy.update_upstream_urls("", audio_url)
+            else:
+                _, video_url, audio_url = select_streams(
+                    master_text, max_height=max_height
+                )
+                self.proxy.update_upstream_urls(video_url, audio_url)
+        except Exception:
+            pass
 
     def send(self, *command):
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(0.3)
-                sock.connect(self.sock_path)
-                sock.sendall(json.dumps({"command": list(command)}).encode() + b"\n")
-        except OSError:
-            pass
+        def _worker():
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.3)
+                    sock.connect(self.sock_path)
+                    sock.sendall(
+                        json.dumps({"command": list(command)}).encode() + b"\n"
+                    )
+            except OSError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def get_property(self, name):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(0.5)
+                sock.settimeout(0.4)
                 sock.connect(self.sock_path)
                 sock.sendall(
                     json.dumps({"command": ["get_property", name]}).encode() + b"\n"
@@ -940,7 +1500,9 @@ class CNewsDirect:
         else:
             self.quit()
 
-    def stop_mpv(self):
+    def stop_mpv(self, stop_proxy=True):
+        if stop_proxy:
+            self.proxy.stop()
         if self.proc is not None:
             self.proc.terminate()
             try:
@@ -957,6 +1519,7 @@ class CNewsDirect:
             pass
 
     def quit(self):
+        self._running = False
         self.stop_mpv()
         self.httpd.shutdown()
         self.httpd.server_close()
